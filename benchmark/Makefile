@@ -11,7 +11,8 @@ echo_server: echo_server.cc ../muduo_net/server.hpp \
              ../lse_engine/PaddedAtomic.h
 	$(CXX) $(CXXFLAGS) -o echo_server echo_server.cc
 
-http_server: http_server.cc ../examples/http/http.hpp ../muduo_net/server.hpp \
+http_server: http_server.cc ../examples/http/http.hpp ../examples/http/cpu_work.h \
+             ../muduo_net/server.hpp \
              ../lse_engine/StealingEngine.h
 	$(CXX) $(CXXFLAGS) -o http_server http_server.cc
 
