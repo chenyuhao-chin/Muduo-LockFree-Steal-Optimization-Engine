@@ -151,7 +151,7 @@ Worker 0 空闲
 
 **设计要点：**
 - **victim 选择策略**：round-robin，避免多线程同时涌向同一个 victim
-- **steal 失败退避**：读取已更新版本号后重试，不 spin
+- **steal 失败退避**：CAS 冲突直接返回，继续扫描下一个 victim
 - **窃取粒度**：一次 steal 只窃取一个任务，维持 LIFO 的局部性优势
 
 > 🤔 为什么不做 batch-steal（一次窃取多个）？TBB 和 Cilk 都是一次窃取多个任务（half of deque），因为它们在纯计算场景。但在网络服务中，任务之间的 locality 很弱（不同连接的不同请求），batch-steal 反而可能导致不必要的跨核迁移。只窃取一个让任务尽可能留在 Owner 的 L1/L2 缓存里。这个取舍是在看了 Cilk 的论文后结合自己的场景做的——**抄最佳实践不代表完全照搬，要理解它为什么那么设计、自己的场景有什么不同**。
@@ -304,7 +304,7 @@ struct alignas(64) PaddedAtomic {
 ```
 
 **什么是伪共享？**  
-两个线程各自频繁读写**不同的变量**，但这两个变量恰好落在同一 CPU 缓存行（512 字节）。当第一个 CPU 写自己的变量时，MESI 协议会**无效化**第二个 CPU 持有的同一缓存行——即使第二个 CPU 的变量没有被写。这就叫做"伪装成共享的冲突"。
+两个线程各自频繁读写**不同的变量**，但这两个变量恰好落在同一 CPU 缓存行（64 字节）。当第一个 CPU 写自己的变量时，MESI 协议会**无效化**第二个 CPU 持有的同一缓存行——即使第二个 CPU 的变量没有被写。这就叫做"伪装成共享的冲突"。
 
 **代价量化：** 一个 64 字节缓存行在 DDR4 双通道上的传输延迟 ≈ 100ns。在 QPS 上万的服务中，每次缓存行传输都是微秒级的性能损失。
 
@@ -412,7 +412,7 @@ for (int i = 0; i < 4096; ++i, idx = (idx + 1753) % 4096) {
 3. **sy% 更低**（37% → 25%）：lock-free 设计显著减少 futex 系统调用
 4. **P99/LSE 偏高**：15s 测试 tail latency 样本不足 + steal 路径的额外延迟。长跑测试（60s+）预计改善
 
-> 🤔 P50 降了 8.9x 但 P99 没降反而偏高——这看起来像矛盾。原因有二：一是 15s 压测对 tail latency 样本不足（95M 样本的 P50，但 P99 只有 ~1M 样本，跨核 steal 的极端情况不一定采够）；二是 steal 路径本身额外增加了 2~3 个 CAS 操作，在极端情况下（多 thief 同时争抢同一个 victim）会导致额外延迟。解决方案是加 adaptive spinning：先 spin 一小段时间再 steal，但 spin 时间要慎重——spin 过量反而吃掉本应该处理请求的 CPU。**目前这个版本选择了不做 spin，保持实现简洁，让用户根据场景选择——这是一个工程权衡，而非技术盲区。**
+> 🤔 P50 降了 8.9x 但 P99 没降反而偏高——这看起来像矛盾。原因有二：一是 15s 压测对 tail latency 样本不足（95M 样本的 P50，但 P99 只有 ~1M 样本，跨核 steal 的极端情况不一定采够）；二是 steal 路径本身额外增加了 2~3 个 CAS 操作，在极端情况下（多 thief 同时争抢同一个 victim）会导致额外延迟。解决方案是加 adaptive spinning：先 spin 一小段时间再 steal，但 spin 时间要慎重——spin 过量反而吃掉本应该处理请求的 CPU。**目前这个版本选择了不做自旋，保持实现简洁，让用户根据场景选择——这是一个工程权衡，而非技术盲区。**
 
 > 📎 **参考：** [HdrHistogram: A High Dynamic Range Statistical Counter](https://hdrhistogram.org/) — P50/P99 采样的统计原理
 
@@ -525,7 +525,7 @@ echo -e "GET /hello HTTP/1.1\r\nHost: test\r\n\r\n" | \
 > 🤔 如果继续做下去，有三个方向：  
 > ① **NUMA-aware steal** —— 当前 steal 是随机选择 victim，在 NUMA 架构下可能跨 socket 窃取导致内存访问延迟暴涨。基于 socket ID 优先同 NUMA node steal 可以改善。  
 > ② **Adaptive steal-vs-share** —— 根据当前 CPU 利用率动态切换 steal 和 share 模式，在高负载（无空闲线程）时自动退化为全局 work-sharing。  
-> ③ **Mutex-pool fallback** —— 当 steal 成本高于 mutex 时（如纯 I/O 场景），自动 fallback 到 Muduo 默认线程池。数据已经证明了不同场景各有优劣。
+> ③ **Mutex-pool fallback** —— 当 steal 成本高于 mutex 时（如纯 I/O 场景），自动 fallback 到 Muduo 默认线程池。纯 HTTP 数据（IO=8 时 QPS 反降 18.6%）说明不同场景各有优劣。
 
 ---
 
